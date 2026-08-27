@@ -1,6 +1,9 @@
-// desk-tray — 모션데스크 메뉴바 앱 (최소 구성)
+// desk-tray — 모션데스크 메뉴바 앱
 // 구조: 메인 스레드 = tao 이벤트 루프(UI), 백그라운드 스레드 = tokio + BLE.
 //       UI→BLE는 mpsc 채널, BLE→UI는 EventLoopProxy 사용자 이벤트.
+mod config;
+
+use config::Config;
 use desk_core::Desk;
 use std::sync::mpsc;
 use std::time::Duration;
@@ -10,19 +13,42 @@ use tao::platform::macos::{ActivationPolicy, EventLoopExtMacOS};
 use tray_icon::menu::{Menu, MenuEvent, MenuItem, PredefinedMenuItem};
 use tray_icon::{TrayIcon, TrayIconBuilder};
 
-const STEP_CM: f32 = 2.0;
 const SCAN_TIMEOUT: Duration = Duration::from_secs(30);
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum Slot {
+    Sit,
+    Stand,
+}
+
+impl Slot {
+    fn name(self) -> &'static str {
+        match self {
+            Slot::Sit => "① 앉기",
+            Slot::Stand => "② 서기",
+        }
+    }
+
+    fn label(self, cm: Option<f32>) -> String {
+        match cm {
+            Some(cm) => format!("{} ({:.0}cm)", self.name(), cm),
+            None => format!("{} (미설정)", self.name()),
+        }
+    }
+}
 
 #[derive(Debug)]
 enum UserEvent {
     Menu(MenuEvent),
-    /// 메뉴바 타이틀 갱신 (예: "↕ 77.4cm", "↕ 연결 중...")
+    /// 메뉴바 타이틀 갱신 (예: "↕ 78cm", "↕ 이동 중...")
     Title(String),
+    /// "현재 높이를 프리셋으로 저장" 완료 (슬롯, 측정된 높이)
+    SlotSaved(Slot, f32),
 }
 
 enum DeskCmd {
-    Up,
-    Down,
+    GoTo(f32),
+    SaveSlot(Slot),
     Stop,
     Refresh,
 }
@@ -43,16 +69,24 @@ fn main() {
     std::thread::spawn(move || ble_thread(cmd_rx, ble_proxy));
     let _ = cmd_tx.send(DeskCmd::Refresh); // 시작하자마자 연결 + 높이 표시
 
-    let menu = Menu::new();
-    let up_item = MenuItem::new(format!("{}cm 상승", STEP_CM), true, None);
-    let down_item = MenuItem::new(format!("{}cm 하강", STEP_CM), true, None);
+    let mut cfg = Config::load();
+
+    let sit_item = MenuItem::new(Slot::Sit.label(cfg.sit), cfg.sit.is_some(), None);
+    let stand_item = MenuItem::new(Slot::Stand.label(cfg.stand), cfg.stand.is_some(), None);
     let stop_item = MenuItem::new("정지", true, None);
+    let save_sit_item = MenuItem::new("현재 높이를 ①로 저장", true, None);
+    let save_stand_item = MenuItem::new("현재 높이를 ②로 저장", true, None);
     let refresh_item = MenuItem::new("새로고침", true, None);
     let quit_item = MenuItem::new("종료", true, None);
+
+    let menu = Menu::new();
     menu.append_items(&[
-        &up_item,
-        &down_item,
+        &sit_item,
+        &stand_item,
         &stop_item,
+        &PredefinedMenuItem::separator(),
+        &save_sit_item,
+        &save_stand_item,
         &PredefinedMenuItem::separator(),
         &refresh_item,
         &PredefinedMenuItem::separator(),
@@ -81,17 +115,31 @@ fn main() {
                     t.set_title(Some(&title));
                 }
             }
+            Event::UserEvent(UserEvent::SlotSaved(slot, cm)) => {
+                let (field, item) = match slot {
+                    Slot::Sit => (&mut cfg.sit, &sit_item),
+                    Slot::Stand => (&mut cfg.stand, &stand_item),
+                };
+                *field = Some(cm);
+                cfg.save();
+                item.set_text(slot.label(Some(cm)));
+                item.set_enabled(true);
+            }
             Event::UserEvent(UserEvent::Menu(e)) => {
-                let cmd = if e.id() == up_item.id() {
-                    Some(DeskCmd::Up)
-                } else if e.id() == down_item.id() {
-                    Some(DeskCmd::Down)
+                let cmd = if e.id() == sit_item.id() {
+                    cfg.sit.map(DeskCmd::GoTo)
+                } else if e.id() == stand_item.id() {
+                    cfg.stand.map(DeskCmd::GoTo)
                 } else if e.id() == stop_item.id() {
                     Some(DeskCmd::Stop)
+                } else if e.id() == save_sit_item.id() {
+                    Some(DeskCmd::SaveSlot(Slot::Sit))
+                } else if e.id() == save_stand_item.id() {
+                    Some(DeskCmd::SaveSlot(Slot::Stand))
                 } else if e.id() == refresh_item.id() {
                     Some(DeskCmd::Refresh)
                 } else if e.id() == quit_item.id() {
-                    // 프로세스 종료 시 BLE 연결이 끊기고 책상은 1초 내 자동 정지함
+                    // 프로세스 종료 시 BLE 연결이 끊기고 책상은 자동 정지함 (데드맨)
                     *control_flow = ControlFlow::Exit;
                     None
                 } else {
@@ -106,7 +154,7 @@ fn main() {
     });
 }
 
-/// BLE 전담 스레드: 명령 채널을 소비하며 결과를 타이틀 이벤트로 보고한다.
+/// BLE 전담 스레드: 명령 채널을 소비하며 결과를 사용자 이벤트로 보고한다.
 fn ble_thread(cmd_rx: mpsc::Receiver<DeskCmd>, proxy: EventLoopProxy<UserEvent>) {
     let rt = tokio::runtime::Runtime::new().expect("tokio 런타임 생성 실패");
     let title = |s: String| {
@@ -132,21 +180,22 @@ fn ble_thread(cmd_rx: mpsc::Receiver<DeskCmd>, proxy: EventLoopProxy<UserEvent>)
 
         let result = rt.block_on(async {
             match cmd {
-                DeskCmd::Up => d.move_by(STEP_CM).await.map(Some),
-                DeskCmd::Down => d.move_by(-STEP_CM).await.map(Some),
-                DeskCmd::Stop => d.stop().await.map(|_| None),
+                DeskCmd::GoTo(cm) => {
+                    title(format!("↕ {:.0}cm로 이동 중...", cm));
+                    d.move_to(cm).await.map(Some)
+                }
+                DeskCmd::Stop => d.stop().await.and(d.height().await).map(Some),
                 DeskCmd::Refresh => d.height().await.map(Some),
+                DeskCmd::SaveSlot(slot) => d.height().await.map(|h| {
+                    let _ = proxy.send_event(UserEvent::SlotSaved(slot, h.cm));
+                    Some(h)
+                }),
             }
         });
 
         match result {
             Ok(Some(h)) => title(format!("↕ {:.0}cm", h.cm)),
-            Ok(None) => {
-                // 정지 직후 현재 높이 재표시
-                if let Ok(h) = rt.block_on(d.height()) {
-                    title(format!("↕ {:.0}cm", h.cm));
-                }
-            }
+            Ok(None) => {}
             Err(e) => {
                 // 연결이 죽었을 가능성이 높음 → 버리고 다음 명령에서 재연결
                 eprintln!("명령 실패: {}", e);

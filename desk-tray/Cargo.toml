@@ -8,3 +8,5 @@ desk-core = { path = "../desk-core" }
 tokio = { workspace = true }
 tray-icon = "0.21"
 tao = "0.34"
+serde = { version = "1", features = ["derive"] }
+toml = "0.8"

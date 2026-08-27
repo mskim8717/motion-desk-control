@@ -442,8 +442,10 @@ name = "desk-tray"
 version = "0.1.0"
 dependencies = [
  "desk-core",
+ "serde",
  "tao",
  "tokio",
+ "toml",
  "tray-icon",
 ]
 
