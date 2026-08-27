@@ -1,25 +1,28 @@
 // desk-tray — 모션데스크 메뉴바 앱
+// 좌클릭: 통합 팝오버 패널 (높이 + 앉기/서기/정지 + 사용 기록 차트)
+// 우클릭: 보조 메뉴 (프리셋 저장/초기화, 새로고침, 종료)
 // 구조: 메인 스레드 = tao 이벤트 루프(UI), 백그라운드 스레드 = tokio + BLE.
-//       UI→BLE는 mpsc 채널, BLE→UI는 EventLoopProxy 사용자 이벤트.
-mod chart;
 mod config;
 mod history;
+mod panel;
 
 use config::Config;
 use desk_core::Desk;
 use futures::StreamExt;
 use std::sync::mpsc;
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
-use tao::dpi::LogicalSize;
+use std::time::{Duration, Instant};
+use tao::dpi::{LogicalPosition, LogicalSize};
 use tao::event::{Event, StartCause, WindowEvent};
-use tao::event_loop::{ControlFlow, EventLoopBuilder, EventLoopProxy};
+use tao::event_loop::{ControlFlow, EventLoopBuilder, EventLoopProxy, EventLoopWindowTarget};
 use tao::platform::macos::{ActivationPolicy, EventLoopExtMacOS};
 use tao::window::{Window, WindowBuilder};
 use tray_icon::menu::{Menu, MenuEvent, MenuItem, PredefinedMenuItem, Submenu};
-use tray_icon::{TrayIcon, TrayIconBuilder};
+use tray_icon::{MouseButton, MouseButtonState, TrayIcon, TrayIconBuilder, TrayIconEvent};
 
 const SCAN_TIMEOUT: Duration = Duration::from_secs(30);
+const PANEL_W: f64 = 360.0;
+const PANEL_H: f64 = 400.0;
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 enum Slot {
@@ -53,14 +56,28 @@ enum ConnState {
     Disconnected,
 }
 
+impl ConnState {
+    fn label(self) -> &'static str {
+        match self {
+            ConnState::Connecting => "연결 중...",
+            ConnState::Connected => "연결됨",
+            ConnState::Disconnected => "연결 안 됨",
+        }
+    }
+}
+
 #[derive(Debug)]
 enum UserEvent {
     Menu(MenuEvent),
+    /// 트레이 아이콘 좌클릭 — 패널 토글
+    TrayClick,
+    /// 패널 버튼 (sit | stand | stop)
+    Ipc(String),
     /// 메뉴바 타이틀 갱신 (예: "↕ 78cm", "↕ 이동 중...")
     Title(String),
     /// "현재 높이를 프리셋으로 저장" 완료 (슬롯, 측정된 높이)
     SlotSaved(Slot, f32),
-    /// 연결 상태 변경 — 메뉴 활성/비활성 갱신
+    /// 연결 상태 변경 — 메뉴/패널 활성 갱신
     Conn(ConnState),
 }
 
@@ -75,10 +92,21 @@ fn main() {
     let mut event_loop = EventLoopBuilder::<UserEvent>::with_user_event().build();
     event_loop.set_activation_policy(ActivationPolicy::Accessory); // 독 아이콘 숨김 (메뉴바 전용)
 
-    // 메뉴 이벤트 → 이벤트 루프로 전달
+    // 메뉴/트레이 이벤트 → 이벤트 루프로 전달
     let proxy = event_loop.create_proxy();
     MenuEvent::set_event_handler(Some(move |e: MenuEvent| {
         let _ = proxy.send_event(UserEvent::Menu(e));
+    }));
+    let proxy = event_loop.create_proxy();
+    TrayIconEvent::set_event_handler(Some(move |e: TrayIconEvent| {
+        if let TrayIconEvent::Click {
+            button: MouseButton::Left,
+            button_state: MouseButtonState::Down,
+            ..
+        } = e
+        {
+            let _ = proxy.send_event(UserEvent::TrayClick);
+        }
     }));
 
     // BLE 백그라운드 스레드
@@ -89,10 +117,7 @@ fn main() {
 
     let mut cfg = Config::load();
 
-    // 책상 조작 항목은 비활성으로 시작 — 연결되면 Conn(Connected) 이벤트가 활성화
-    let sit_item = MenuItem::new(Slot::Sit.label(cfg.sit), false, None);
-    let stand_item = MenuItem::new(Slot::Stand.label(cfg.stand), false, None);
-    let stop_item = MenuItem::new("정지", false, None);
+    // 우클릭 보조 메뉴 (좌클릭은 패널)
     let save_sit_item = MenuItem::new("현재 높이를 ①로 저장", false, None);
     let save_stand_item = MenuItem::new("현재 높이를 ②로 저장", false, None);
     let reset_sit_item = MenuItem::new(Slot::Sit.name(), cfg.sit.is_some(), None);
@@ -103,21 +128,15 @@ fn main() {
         &[&reset_sit_item, &reset_stand_item],
     )
     .expect("초기화 서브메뉴 구성 실패");
-    let chart_item = MenuItem::new("사용 기록 보기", true, None);
     let refresh_item = MenuItem::new("새로고침", false, None);
     let quit_item = MenuItem::new("종료", true, None);
 
     let menu = Menu::new();
     menu.append_items(&[
-        &sit_item,
-        &stand_item,
-        &stop_item,
-        &PredefinedMenuItem::separator(),
         &save_sit_item,
         &save_stand_item,
         &reset_menu,
         &PredefinedMenuItem::separator(),
-        &chart_item,
         &refresh_item,
         &PredefinedMenuItem::separator(),
         &quit_item,
@@ -126,100 +145,124 @@ fn main() {
 
     // macOS에서는 이벤트 루프 시작 후에 트레이 아이콘을 만들어야 함
     let mut tray: Option<TrayIcon> = None;
-    // 사용 기록 창 (열려 있는 동안만 Some)
-    let mut chart_win: Option<(Window, wry::WebView)> = None;
+    // 팝오버 패널 (열려 있는 동안만 Some)
+    let mut panel_win: Option<(Window, wry::WebView)> = None;
+    // 포커스 상실로 패널이 닫힌 직후의 트레이 클릭은 "닫기" 의도로 보고 무시
+    let mut panel_closed_at: Option<Instant> = None;
+    let mut cur_title = String::from("↕ 연결 중...");
+    let mut cur_conn = ConnState::Connecting;
+
+    let ipc_proxy = event_loop.create_proxy();
 
     event_loop.run(move |event, target, control_flow| {
         *control_flow = ControlFlow::Wait;
 
         match event {
-            // 닫기 요청 또는 포커스 상실(다른 곳 클릭) 시 팝오버 닫기
+            Event::NewEvents(StartCause::Init) => {
+                tray = Some(
+                    TrayIconBuilder::new()
+                        .with_title(&cur_title)
+                        .with_menu(Box::new(menu.clone()))
+                        .with_menu_on_left_click(false)
+                        .build()
+                        .expect("트레이 아이콘 생성 실패"),
+                );
+            }
+            // 닫기 요청 또는 포커스 상실(다른 곳 클릭) 시 패널 닫기
             Event::WindowEvent {
                 event: WindowEvent::CloseRequested | WindowEvent::Focused(false),
                 window_id,
                 ..
             } => {
-                if chart_win.as_ref().map(|(w, _)| w.id()) == Some(window_id) {
-                    chart_win = None;
+                if panel_win.as_ref().map(|(w, _)| w.id()) == Some(window_id) {
+                    panel_win = None;
+                    panel_closed_at = Some(Instant::now());
                 }
             }
-            Event::NewEvents(StartCause::Init) => {
-                tray = Some(
-                    TrayIconBuilder::new()
-                        .with_title("↕ 연결 중...")
-                        .with_menu(Box::new(menu.clone()))
-                        .build()
-                        .expect("트레이 아이콘 생성 실패"),
-                );
+            Event::UserEvent(UserEvent::TrayClick) => {
+                if panel_win.is_some() {
+                    panel_win = None;
+                } else {
+                    // 방금 포커스 상실로 닫혔다면 이 클릭은 닫기 의도였음 → 무시
+                    let just_closed = panel_closed_at
+                        .map(|t| t.elapsed() < Duration::from_millis(300))
+                        .unwrap_or(false);
+                    if !just_closed {
+                        let state = panel::PanelState {
+                            big: cur_title.trim_start_matches("↕ "),
+                            connected: cur_conn == ConnState::Connected,
+                            sit_label: cfg.sit.map(|cm| Slot::Sit.label(Some(cm))),
+                            stand_label: cfg.stand.map(|cm| Slot::Stand.label(Some(cm))),
+                            samples: &history::load_recent(86400),
+                            threshold_cm: standing_threshold(&cfg),
+                        };
+                        match open_panel(target, tray.as_ref(), &ipc_proxy, &panel::html(&state))
+                        {
+                            Ok(win) => panel_win = Some(win),
+                            Err(e) => eprintln!("패널 생성 실패: {}", e),
+                        }
+                    }
+                }
+            }
+            Event::UserEvent(UserEvent::Ipc(msg)) => {
+                let cmd = match msg.as_str() {
+                    "sit" => cfg.sit.map(DeskCmd::GoTo),
+                    "stand" => cfg.stand.map(DeskCmd::GoTo),
+                    "stop" => Some(DeskCmd::Stop),
+                    _ => None,
+                };
+                if let Some(cmd) = cmd {
+                    let _ = cmd_tx.send(cmd);
+                }
             }
             Event::UserEvent(UserEvent::Title(title)) => {
+                cur_title = title;
                 if let Some(t) = &tray {
-                    t.set_title(Some(&title));
+                    t.set_title(Some(&cur_title));
+                }
+                if let Some((_, wv)) = &panel_win {
+                    let big = cur_title.trim_start_matches("↕ ").replace('\'', "");
+                    let _ = wv.evaluate_script(&format!("setTitle('{}')", big));
                 }
             }
             Event::UserEvent(UserEvent::Conn(state)) => {
+                cur_conn = state;
                 let connected = state == ConnState::Connected;
-                sit_item.set_enabled(connected && cfg.sit.is_some());
-                stand_item.set_enabled(connected && cfg.stand.is_some());
-                stop_item.set_enabled(connected);
                 save_sit_item.set_enabled(connected);
                 save_stand_item.set_enabled(connected);
                 // 새로고침은 끊김 상태에서 재연결 버튼을 겸함 — 연결 시도 중에만 비활성
                 refresh_item.set_enabled(state != ConnState::Connecting);
+                if let Some((_, wv)) = &panel_win {
+                    let _ = wv.evaluate_script(&format!(
+                        "setConn({},'{}')",
+                        connected,
+                        state.label()
+                    ));
+                }
             }
             Event::UserEvent(UserEvent::SlotSaved(slot, cm)) => {
-                let (field, item, reset_item) = match slot {
-                    Slot::Sit => (&mut cfg.sit, &sit_item, &reset_sit_item),
-                    Slot::Stand => (&mut cfg.stand, &stand_item, &reset_stand_item),
+                let (field, reset_item) = match slot {
+                    Slot::Sit => (&mut cfg.sit, &reset_sit_item),
+                    Slot::Stand => (&mut cfg.stand, &reset_stand_item),
                 };
                 *field = Some(cm);
                 cfg.save();
-                item.set_text(slot.label(Some(cm)));
-                item.set_enabled(true);
                 reset_item.set_enabled(true);
             }
             Event::UserEvent(UserEvent::Menu(e)) => {
-                let cmd = if e.id() == sit_item.id() {
-                    cfg.sit.map(DeskCmd::GoTo)
-                } else if e.id() == stand_item.id() {
-                    cfg.stand.map(DeskCmd::GoTo)
-                } else if e.id() == stop_item.id() {
-                    Some(DeskCmd::Stop)
-                } else if e.id() == save_sit_item.id() {
+                let cmd = if e.id() == save_sit_item.id() {
                     Some(DeskCmd::SaveSlot(Slot::Sit))
                 } else if e.id() == save_stand_item.id() {
                     Some(DeskCmd::SaveSlot(Slot::Stand))
                 } else if e.id() == reset_sit_item.id() || e.id() == reset_stand_item.id() {
-                    let slot = if e.id() == reset_sit_item.id() {
-                        Slot::Sit
+                    let (field, reset_item) = if e.id() == reset_sit_item.id() {
+                        (&mut cfg.sit, &reset_sit_item)
                     } else {
-                        Slot::Stand
-                    };
-                    let (field, item, reset_item) = match slot {
-                        Slot::Sit => (&mut cfg.sit, &sit_item, &reset_sit_item),
-                        Slot::Stand => (&mut cfg.stand, &stand_item, &reset_stand_item),
+                        (&mut cfg.stand, &reset_stand_item)
                     };
                     *field = None;
                     cfg.save();
-                    item.set_text(slot.label(None));
-                    item.set_enabled(false);
                     reset_item.set_enabled(false);
-                    None
-                } else if e.id() == chart_item.id() {
-                    if chart_win.is_some() {
-                        chart_win = None; // 이미 열려 있으면 토글로 닫기
-                    } else {
-                        // 서기 기준: 두 프리셋의 중간값, 없으면 90cm
-                        let threshold = match (cfg.sit, cfg.stand) {
-                            (Some(a), Some(b)) => (a + b) / 2.0,
-                            _ => 90.0,
-                        };
-                        let html = chart::html(&history::load_recent(86400), threshold);
-                        match open_chart_window(target, &html) {
-                            Ok(win) => chart_win = Some(win),
-                            Err(e) => eprintln!("사용 기록 창 생성 실패: {}", e),
-                        }
-                    }
                     None
                 } else if e.id() == refresh_item.id() {
                     Some(DeskCmd::Refresh)
@@ -239,32 +282,49 @@ fn main() {
     });
 }
 
-fn open_chart_window(
-    target: &tao::event_loop::EventLoopWindowTarget<UserEvent>,
+/// 서기 판정 기준: 두 프리셋의 중간값, 없으면 90cm
+fn standing_threshold(cfg: &Config) -> f32 {
+    match (cfg.sit, cfg.stand) {
+        (Some(a), Some(b)) => (a + b) / 2.0,
+        _ => 90.0,
+    }
+}
+
+/// 트레이 아이콘 바로 아래에 팝오버 패널을 연다.
+fn open_panel(
+    target: &EventLoopWindowTarget<UserEvent>,
+    tray: Option<&TrayIcon>,
+    proxy: &EventLoopProxy<UserEvent>,
     html: &str,
 ) -> Result<(Window, wry::WebView), Box<dyn std::error::Error>> {
-    const W: f64 = 520.0;
-    const H: f64 = 340.0;
-    // 팝오버 스타일: 메뉴바 바로 아래 오른쪽에 배치 (트레이 아이콘 부근)
-    let pos = target
+    let scale = target
         .primary_monitor()
-        .map(|m| {
-            let size = m.size().to_logical::<f64>(m.scale_factor());
-            tao::dpi::LogicalPosition::new(size.width - W - 12.0, 34.0)
+        .map(|m| m.scale_factor())
+        .unwrap_or(1.0);
+    let pos = tray
+        .and_then(|t| t.rect())
+        .map(|r| {
+            let p = r.position.to_logical::<f64>(scale);
+            let s = r.size.to_logical::<f64>(scale);
+            LogicalPosition::new(p.x + s.width / 2.0 - PANEL_W / 2.0, p.y + s.height + 6.0)
         })
-        .unwrap_or(tao::dpi::LogicalPosition::new(0.0, 34.0));
+        .unwrap_or(LogicalPosition::new(0.0, 34.0));
 
     let window = WindowBuilder::new()
-        .with_title("MotionDesk 사용 기록")
-        .with_inner_size(LogicalSize::new(W, H))
+        .with_title("MotionDesk")
+        .with_inner_size(LogicalSize::new(PANEL_W, PANEL_H))
         .with_position(pos)
         .with_decorations(false)
         .with_transparent(true)
         .with_always_on_top(true)
         .with_resizable(false)
         .build(target)?;
+    let proxy = proxy.clone();
     let webview = wry::WebViewBuilder::new()
         .with_transparent(true)
+        .with_ipc_handler(move |req| {
+            let _ = proxy.send_event(UserEvent::Ipc(req.body().to_string()));
+        })
         .with_html(html)
         .build(&window)?;
     window.set_focus(); // 포커스를 받아야 포커스 상실 시 자동 닫힘이 동작
@@ -311,7 +371,7 @@ fn ble_thread(cmd_rx: mpsc::Receiver<DeskCmd>, proxy: EventLoopProxy<UserEvent>)
                         history::append(h.cm);
                         *last_cm.lock().unwrap() = Some(h.cm);
                     }
-                    // 위치 notify 구독: 물리 스위치로 움직여도 메뉴바 높이가 실시간 갱신됨
+                    // 위치 notify 구독: 물리 스위치로 움직여도 높이가 실시간 갱신됨
                     match rt.block_on(d.subscribe_height()) {
                         Ok(stream) => {
                             let p = proxy.clone();
