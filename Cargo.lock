@@ -532,7 +532,7 @@ dependencies = [
 
 [[package]]
 name = "desk-cli"
-version = "0.1.0"
+version = "0.0.1"
 dependencies = [
  "clap",
  "desk-core",
@@ -541,7 +541,7 @@ dependencies = [
 
 [[package]]
 name = "desk-core"
-version = "0.1.0"
+version = "0.0.1"
 dependencies = [
  "btleplug",
  "futures",
@@ -551,7 +551,7 @@ dependencies = [
 
 [[package]]
 name = "desk-tray"
-version = "0.1.0"
+version = "0.0.1"
 dependencies = [
  "desk-core",
  "futures",
