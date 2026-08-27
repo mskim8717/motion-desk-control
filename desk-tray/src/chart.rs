@@ -8,15 +8,17 @@ pub fn html(samples: &[(i64, f32)], threshold_cm: f32) -> String {
         .join(",");
     format!(
         r##"<!doctype html><html><head><meta charset="utf-8"><style>
-html,body{{margin:0;height:100%;background:#1c1c1e;color:#e5e5e7;
+html,body{{margin:0;height:100%;background:transparent;color:#e5e5e7;
 font:13px -apple-system,'Apple SD Gothic Neo',sans-serif;overflow:hidden;
 -webkit-user-select:none;user-select:none}}
+#wrap{{position:fixed;inset:0;background:rgba(28,28,30,.96);border-radius:12px;
+border:1px solid rgba(255,255,255,.12);overflow:hidden}}
 #head{{display:flex;justify-content:space-between;align-items:baseline;padding:14px 16px 6px}}
 #title{{font-weight:600;font-size:15px}} #summary{{color:#98989d}}
 canvas{{display:block}}
-</style></head><body>
+</style></head><body><div id="wrap">
 <div id="head"><span id="title">지난 24시간</span><span id="summary"></span></div>
-<canvas id="c"></canvas>
+<canvas id="c"></canvas></div>
 <script>
 const DATA=[{data}],TH={threshold_cm},NOW=Date.now()/1000,FROM=NOW-86400;
 const cv=document.getElementById('c'),ctx=cv.getContext('2d');

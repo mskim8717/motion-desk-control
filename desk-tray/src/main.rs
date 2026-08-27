@@ -133,8 +133,9 @@ fn main() {
         *control_flow = ControlFlow::Wait;
 
         match event {
+            // 닫기 요청 또는 포커스 상실(다른 곳 클릭) 시 팝오버 닫기
             Event::WindowEvent {
-                event: WindowEvent::CloseRequested,
+                event: WindowEvent::CloseRequested | WindowEvent::Focused(false),
                 window_id,
                 ..
             } => {
@@ -205,15 +206,19 @@ fn main() {
                     reset_item.set_enabled(false);
                     None
                 } else if e.id() == chart_item.id() {
-                    // 서기 기준: 두 프리셋의 중간값, 없으면 90cm
-                    let threshold = match (cfg.sit, cfg.stand) {
-                        (Some(a), Some(b)) => (a + b) / 2.0,
-                        _ => 90.0,
-                    };
-                    let html = chart::html(&history::load_recent(86400), threshold);
-                    match open_chart_window(target, &html) {
-                        Ok(win) => chart_win = Some(win),
-                        Err(e) => eprintln!("사용 기록 창 생성 실패: {}", e),
+                    if chart_win.is_some() {
+                        chart_win = None; // 이미 열려 있으면 토글로 닫기
+                    } else {
+                        // 서기 기준: 두 프리셋의 중간값, 없으면 90cm
+                        let threshold = match (cfg.sit, cfg.stand) {
+                            (Some(a), Some(b)) => (a + b) / 2.0,
+                            _ => 90.0,
+                        };
+                        let html = chart::html(&history::load_recent(86400), threshold);
+                        match open_chart_window(target, &html) {
+                            Ok(win) => chart_win = Some(win),
+                            Err(e) => eprintln!("사용 기록 창 생성 실패: {}", e),
+                        }
                     }
                     None
                 } else if e.id() == refresh_item.id() {
@@ -238,12 +243,31 @@ fn open_chart_window(
     target: &tao::event_loop::EventLoopWindowTarget<UserEvent>,
     html: &str,
 ) -> Result<(Window, wry::WebView), Box<dyn std::error::Error>> {
+    const W: f64 = 520.0;
+    const H: f64 = 340.0;
+    // 팝오버 스타일: 메뉴바 바로 아래 오른쪽에 배치 (트레이 아이콘 부근)
+    let pos = target
+        .primary_monitor()
+        .map(|m| {
+            let size = m.size().to_logical::<f64>(m.scale_factor());
+            tao::dpi::LogicalPosition::new(size.width - W - 12.0, 34.0)
+        })
+        .unwrap_or(tao::dpi::LogicalPosition::new(0.0, 34.0));
+
     let window = WindowBuilder::new()
         .with_title("MotionDesk 사용 기록")
-        .with_inner_size(LogicalSize::new(520.0, 340.0))
+        .with_inner_size(LogicalSize::new(W, H))
+        .with_position(pos)
+        .with_decorations(false)
+        .with_transparent(true)
+        .with_always_on_top(true)
+        .with_resizable(false)
         .build(target)?;
-    let webview = wry::WebViewBuilder::new().with_html(html).build(&window)?;
-    window.set_focus();
+    let webview = wry::WebViewBuilder::new()
+        .with_transparent(true)
+        .with_html(html)
+        .build(&window)?;
+    window.set_focus(); // 포커스를 받아야 포커스 상실 시 자동 닫힘이 동작
     Ok((window, webview))
 }
 
