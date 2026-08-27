@@ -1,0 +1,10 @@
+[package]
+name = "desk-tray"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+desk-core = { path = "../desk-core" }
+tokio = { workspace = true }
+tray-icon = "0.21"
+tao = "0.34"

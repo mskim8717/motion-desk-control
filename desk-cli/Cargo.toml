@@ -1,0 +1,13 @@
+[package]
+name = "desk-cli"
+version = "0.1.0"
+edition = "2021"
+
+[[bin]]
+name = "desk"
+path = "src/main.rs"
+
+[dependencies]
+desk-core = { path = "../desk-core" }
+clap = { version = "4", features = ["derive"] }
+tokio = { workspace = true }
