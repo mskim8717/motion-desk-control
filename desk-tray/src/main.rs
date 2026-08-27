@@ -38,6 +38,16 @@ impl Slot {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum ConnState {
+    /// 연결 시도 중 — 조작 불가
+    Connecting,
+    /// 연결됨 — 전체 조작 가능
+    Connected,
+    /// 연결 실패/끊김 — 새로고침(재연결)만 가능
+    Disconnected,
+}
+
 #[derive(Debug)]
 enum UserEvent {
     Menu(MenuEvent),
@@ -45,6 +55,8 @@ enum UserEvent {
     Title(String),
     /// "현재 높이를 프리셋으로 저장" 완료 (슬롯, 측정된 높이)
     SlotSaved(Slot, f32),
+    /// 연결 상태 변경 — 메뉴 활성/비활성 갱신
+    Conn(ConnState),
 }
 
 enum DeskCmd {
@@ -72,11 +84,12 @@ fn main() {
 
     let mut cfg = Config::load();
 
-    let sit_item = MenuItem::new(Slot::Sit.label(cfg.sit), cfg.sit.is_some(), None);
-    let stand_item = MenuItem::new(Slot::Stand.label(cfg.stand), cfg.stand.is_some(), None);
-    let stop_item = MenuItem::new("정지", true, None);
-    let save_sit_item = MenuItem::new("현재 높이를 ①로 저장", true, None);
-    let save_stand_item = MenuItem::new("현재 높이를 ②로 저장", true, None);
+    // 책상 조작 항목은 비활성으로 시작 — 연결되면 Conn(Connected) 이벤트가 활성화
+    let sit_item = MenuItem::new(Slot::Sit.label(cfg.sit), false, None);
+    let stand_item = MenuItem::new(Slot::Stand.label(cfg.stand), false, None);
+    let stop_item = MenuItem::new("정지", false, None);
+    let save_sit_item = MenuItem::new("현재 높이를 ①로 저장", false, None);
+    let save_stand_item = MenuItem::new("현재 높이를 ②로 저장", false, None);
     let reset_sit_item = MenuItem::new(Slot::Sit.name(), cfg.sit.is_some(), None);
     let reset_stand_item = MenuItem::new(Slot::Stand.name(), cfg.stand.is_some(), None);
     let reset_menu = Submenu::with_items(
@@ -85,7 +98,7 @@ fn main() {
         &[&reset_sit_item, &reset_stand_item],
     )
     .expect("초기화 서브메뉴 구성 실패");
-    let refresh_item = MenuItem::new("새로고침", true, None);
+    let refresh_item = MenuItem::new("새로고침", false, None);
     let quit_item = MenuItem::new("종료", true, None);
 
     let menu = Menu::new();
@@ -124,6 +137,16 @@ fn main() {
                 if let Some(t) = &tray {
                     t.set_title(Some(&title));
                 }
+            }
+            Event::UserEvent(UserEvent::Conn(state)) => {
+                let connected = state == ConnState::Connected;
+                sit_item.set_enabled(connected && cfg.sit.is_some());
+                stand_item.set_enabled(connected && cfg.stand.is_some());
+                stop_item.set_enabled(connected);
+                save_sit_item.set_enabled(connected);
+                save_stand_item.set_enabled(connected);
+                // 새로고침은 끊김 상태에서 재연결 버튼을 겸함 — 연결 시도 중에만 비활성
+                refresh_item.set_enabled(state != ConnState::Connecting);
             }
             Event::UserEvent(UserEvent::SlotSaved(slot, cm)) => {
                 let (field, item, reset_item) = match slot {
@@ -187,6 +210,9 @@ fn ble_thread(cmd_rx: mpsc::Receiver<DeskCmd>, proxy: EventLoopProxy<UserEvent>)
     let title = |s: String| {
         let _ = proxy.send_event(UserEvent::Title(s));
     };
+    let conn = |s: ConnState| {
+        let _ = proxy.send_event(UserEvent::Conn(s));
+    };
 
     let mut desk: Option<Desk> = None;
 
@@ -194,6 +220,7 @@ fn ble_thread(cmd_rx: mpsc::Receiver<DeskCmd>, proxy: EventLoopProxy<UserEvent>)
         // 연결이 없으면 먼저 연결 시도
         if desk.is_none() {
             title("↕ 연결 중...".into());
+            conn(ConnState::Connecting);
             match rt.block_on(Desk::connect(SCAN_TIMEOUT)) {
                 Ok(d) => {
                     // 위치 notify 구독: 물리 스위치로 움직여도 메뉴바 높이가 실시간 갱신됨
@@ -213,10 +240,12 @@ fn ble_thread(cmd_rx: mpsc::Receiver<DeskCmd>, proxy: EventLoopProxy<UserEvent>)
                         Err(e) => eprintln!("높이 알림 구독 실패: {}", e),
                     }
                     desk = Some(d);
+                    conn(ConnState::Connected);
                 }
                 Err(e) => {
                     eprintln!("연결 실패: {}", e);
                     title("↕ 연결 안 됨".into());
+                    conn(ConnState::Disconnected);
                     continue;
                 }
             }
@@ -246,6 +275,7 @@ fn ble_thread(cmd_rx: mpsc::Receiver<DeskCmd>, proxy: EventLoopProxy<UserEvent>)
                 eprintln!("명령 실패: {}", e);
                 desk = None;
                 title("↕ 연결 안 됨".into());
+                conn(ConnState::Disconnected);
             }
         }
     }
