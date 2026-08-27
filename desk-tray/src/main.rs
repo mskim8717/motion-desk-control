@@ -1,16 +1,21 @@
 // desk-tray — 모션데스크 메뉴바 앱
 // 구조: 메인 스레드 = tao 이벤트 루프(UI), 백그라운드 스레드 = tokio + BLE.
 //       UI→BLE는 mpsc 채널, BLE→UI는 EventLoopProxy 사용자 이벤트.
+mod chart;
 mod config;
+mod history;
 
 use config::Config;
 use desk_core::Desk;
 use futures::StreamExt;
 use std::sync::mpsc;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
-use tao::event::{Event, StartCause};
+use tao::dpi::LogicalSize;
+use tao::event::{Event, StartCause, WindowEvent};
 use tao::event_loop::{ControlFlow, EventLoopBuilder, EventLoopProxy};
 use tao::platform::macos::{ActivationPolicy, EventLoopExtMacOS};
+use tao::window::{Window, WindowBuilder};
 use tray_icon::menu::{Menu, MenuEvent, MenuItem, PredefinedMenuItem, Submenu};
 use tray_icon::{TrayIcon, TrayIconBuilder};
 
@@ -98,6 +103,7 @@ fn main() {
         &[&reset_sit_item, &reset_stand_item],
     )
     .expect("초기화 서브메뉴 구성 실패");
+    let chart_item = MenuItem::new("사용 기록 보기", true, None);
     let refresh_item = MenuItem::new("새로고침", false, None);
     let quit_item = MenuItem::new("종료", true, None);
 
@@ -111,6 +117,7 @@ fn main() {
         &save_stand_item,
         &reset_menu,
         &PredefinedMenuItem::separator(),
+        &chart_item,
         &refresh_item,
         &PredefinedMenuItem::separator(),
         &quit_item,
@@ -119,11 +126,22 @@ fn main() {
 
     // macOS에서는 이벤트 루프 시작 후에 트레이 아이콘을 만들어야 함
     let mut tray: Option<TrayIcon> = None;
+    // 사용 기록 창 (열려 있는 동안만 Some)
+    let mut chart_win: Option<(Window, wry::WebView)> = None;
 
-    event_loop.run(move |event, _, control_flow| {
+    event_loop.run(move |event, target, control_flow| {
         *control_flow = ControlFlow::Wait;
 
         match event {
+            Event::WindowEvent {
+                event: WindowEvent::CloseRequested,
+                window_id,
+                ..
+            } => {
+                if chart_win.as_ref().map(|(w, _)| w.id()) == Some(window_id) {
+                    chart_win = None;
+                }
+            }
             Event::NewEvents(StartCause::Init) => {
                 tray = Some(
                     TrayIconBuilder::new()
@@ -186,6 +204,18 @@ fn main() {
                     item.set_enabled(false);
                     reset_item.set_enabled(false);
                     None
+                } else if e.id() == chart_item.id() {
+                    // 서기 기준: 두 프리셋의 중간값, 없으면 90cm
+                    let threshold = match (cfg.sit, cfg.stand) {
+                        (Some(a), Some(b)) => (a + b) / 2.0,
+                        _ => 90.0,
+                    };
+                    let html = chart::html(&history::load_recent(86400), threshold);
+                    match open_chart_window(target, &html) {
+                        Ok(win) => chart_win = Some(win),
+                        Err(e) => eprintln!("사용 기록 창 생성 실패: {}", e),
+                    }
+                    None
                 } else if e.id() == refresh_item.id() {
                     Some(DeskCmd::Refresh)
                 } else if e.id() == quit_item.id() {
@@ -204,6 +234,19 @@ fn main() {
     });
 }
 
+fn open_chart_window(
+    target: &tao::event_loop::EventLoopWindowTarget<UserEvent>,
+    html: &str,
+) -> Result<(Window, wry::WebView), Box<dyn std::error::Error>> {
+    let window = WindowBuilder::new()
+        .with_title("MotionDesk 사용 기록")
+        .with_inner_size(LogicalSize::new(520.0, 340.0))
+        .build(target)?;
+    let webview = wry::WebViewBuilder::new().with_html(html).build(&window)?;
+    window.set_focus();
+    Ok((window, webview))
+}
+
 /// BLE 전담 스레드: 명령 채널을 소비하며 결과를 사용자 이벤트로 보고한다.
 fn ble_thread(cmd_rx: mpsc::Receiver<DeskCmd>, proxy: EventLoopProxy<UserEvent>) {
     let rt = tokio::runtime::Runtime::new().expect("tokio 런타임 생성 실패");
@@ -215,6 +258,22 @@ fn ble_thread(cmd_rx: mpsc::Receiver<DeskCmd>, proxy: EventLoopProxy<UserEvent>)
     };
 
     let mut desk: Option<Desk> = None;
+    // 마지막으로 알려진 높이 — notify 태스크가 갱신, 하트비트 태스크가 기록
+    let last_cm: Arc<Mutex<Option<f32>>> = Arc::new(Mutex::new(None));
+    {
+        // 5분마다 현재 높이를 이력에 기록 (움직임이 없어도 차트가 이어지도록)
+        let last_cm = last_cm.clone();
+        rt.spawn(async move {
+            let mut tick = tokio::time::interval(Duration::from_secs(300));
+            tick.tick().await; // 첫 틱은 즉시 발화하므로 건너뜀
+            loop {
+                tick.tick().await;
+                if let Some(cm) = *last_cm.lock().unwrap() {
+                    history::append(cm);
+                }
+            }
+        });
+    }
 
     while let Ok(cmd) = cmd_rx.recv() {
         // 연결이 없으면 먼저 연결 시도
@@ -223,17 +282,34 @@ fn ble_thread(cmd_rx: mpsc::Receiver<DeskCmd>, proxy: EventLoopProxy<UserEvent>)
             conn(ConnState::Connecting);
             match rt.block_on(Desk::connect(SCAN_TIMEOUT)) {
                 Ok(d) => {
+                    // 연결 시점 높이를 이력에 기록
+                    if let Ok(h) = rt.block_on(d.height()) {
+                        history::append(h.cm);
+                        *last_cm.lock().unwrap() = Some(h.cm);
+                    }
                     // 위치 notify 구독: 물리 스위치로 움직여도 메뉴바 높이가 실시간 갱신됨
                     match rt.block_on(d.subscribe_height()) {
                         Ok(stream) => {
                             let p = proxy.clone();
+                            let last_cm = last_cm.clone();
                             rt.spawn(async move {
                                 let mut stream = Box::pin(stream);
+                                let mut last_logged: Option<(i64, u16)> = None;
                                 while let Some(h) = stream.next().await {
                                     let _ = p.send_event(UserEvent::Title(format!(
                                         "↕ {:.0}cm",
                                         h.cm
                                     )));
+                                    *last_cm.lock().unwrap() = Some(h.cm);
+                                    // 이동 중 이력: raw가 바뀌었을 때 초당 1회로 제한
+                                    let ts = history::now_ts();
+                                    let changed = last_logged
+                                        .map(|(t, raw)| raw != h.raw && ts > t)
+                                        .unwrap_or(true);
+                                    if changed {
+                                        history::append(h.cm);
+                                        last_logged = Some((ts, h.raw));
+                                    }
                                 }
                             });
                         }
