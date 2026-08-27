@@ -10,7 +10,7 @@ use std::time::Duration;
 use tao::event::{Event, StartCause};
 use tao::event_loop::{ControlFlow, EventLoopBuilder, EventLoopProxy};
 use tao::platform::macos::{ActivationPolicy, EventLoopExtMacOS};
-use tray_icon::menu::{Menu, MenuEvent, MenuItem, PredefinedMenuItem};
+use tray_icon::menu::{Menu, MenuEvent, MenuItem, PredefinedMenuItem, Submenu};
 use tray_icon::{TrayIcon, TrayIconBuilder};
 
 const SCAN_TIMEOUT: Duration = Duration::from_secs(30);
@@ -76,6 +76,14 @@ fn main() {
     let stop_item = MenuItem::new("정지", true, None);
     let save_sit_item = MenuItem::new("현재 높이를 ①로 저장", true, None);
     let save_stand_item = MenuItem::new("현재 높이를 ②로 저장", true, None);
+    let reset_sit_item = MenuItem::new(Slot::Sit.name(), cfg.sit.is_some(), None);
+    let reset_stand_item = MenuItem::new(Slot::Stand.name(), cfg.stand.is_some(), None);
+    let reset_menu = Submenu::with_items(
+        "프리셋 초기화",
+        true,
+        &[&reset_sit_item, &reset_stand_item],
+    )
+    .expect("초기화 서브메뉴 구성 실패");
     let refresh_item = MenuItem::new("새로고침", true, None);
     let quit_item = MenuItem::new("종료", true, None);
 
@@ -87,6 +95,7 @@ fn main() {
         &PredefinedMenuItem::separator(),
         &save_sit_item,
         &save_stand_item,
+        &reset_menu,
         &PredefinedMenuItem::separator(),
         &refresh_item,
         &PredefinedMenuItem::separator(),
@@ -116,14 +125,15 @@ fn main() {
                 }
             }
             Event::UserEvent(UserEvent::SlotSaved(slot, cm)) => {
-                let (field, item) = match slot {
-                    Slot::Sit => (&mut cfg.sit, &sit_item),
-                    Slot::Stand => (&mut cfg.stand, &stand_item),
+                let (field, item, reset_item) = match slot {
+                    Slot::Sit => (&mut cfg.sit, &sit_item, &reset_sit_item),
+                    Slot::Stand => (&mut cfg.stand, &stand_item, &reset_stand_item),
                 };
                 *field = Some(cm);
                 cfg.save();
                 item.set_text(slot.label(Some(cm)));
                 item.set_enabled(true);
+                reset_item.set_enabled(true);
             }
             Event::UserEvent(UserEvent::Menu(e)) => {
                 let cmd = if e.id() == sit_item.id() {
@@ -136,6 +146,22 @@ fn main() {
                     Some(DeskCmd::SaveSlot(Slot::Sit))
                 } else if e.id() == save_stand_item.id() {
                     Some(DeskCmd::SaveSlot(Slot::Stand))
+                } else if e.id() == reset_sit_item.id() || e.id() == reset_stand_item.id() {
+                    let slot = if e.id() == reset_sit_item.id() {
+                        Slot::Sit
+                    } else {
+                        Slot::Stand
+                    };
+                    let (field, item, reset_item) = match slot {
+                        Slot::Sit => (&mut cfg.sit, &sit_item, &reset_sit_item),
+                        Slot::Stand => (&mut cfg.stand, &stand_item, &reset_stand_item),
+                    };
+                    *field = None;
+                    cfg.save();
+                    item.set_text(slot.label(None));
+                    item.set_enabled(false);
+                    reset_item.set_enabled(false);
+                    None
                 } else if e.id() == refresh_item.id() {
                     Some(DeskCmd::Refresh)
                 } else if e.id() == quit_item.id() {
