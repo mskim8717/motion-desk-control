@@ -5,6 +5,7 @@ mod config;
 
 use config::Config;
 use desk_core::Desk;
+use futures::StreamExt;
 use std::sync::mpsc;
 use std::time::Duration;
 use tao::event::{Event, StartCause};
@@ -194,7 +195,25 @@ fn ble_thread(cmd_rx: mpsc::Receiver<DeskCmd>, proxy: EventLoopProxy<UserEvent>)
         if desk.is_none() {
             title("↕ 연결 중...".into());
             match rt.block_on(Desk::connect(SCAN_TIMEOUT)) {
-                Ok(d) => desk = Some(d),
+                Ok(d) => {
+                    // 위치 notify 구독: 물리 스위치로 움직여도 메뉴바 높이가 실시간 갱신됨
+                    match rt.block_on(d.subscribe_height()) {
+                        Ok(stream) => {
+                            let p = proxy.clone();
+                            rt.spawn(async move {
+                                let mut stream = Box::pin(stream);
+                                while let Some(h) = stream.next().await {
+                                    let _ = p.send_event(UserEvent::Title(format!(
+                                        "↕ {:.0}cm",
+                                        h.cm
+                                    )));
+                                }
+                            });
+                        }
+                        Err(e) => eprintln!("높이 알림 구독 실패: {}", e),
+                    }
+                    desk = Some(d);
+                }
                 Err(e) => {
                     eprintln!("연결 실패: {}", e);
                     title("↕ 연결 안 됨".into());

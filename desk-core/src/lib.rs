@@ -51,6 +51,19 @@ fn cm_to_raw(cm: f32) -> u16 {
     ((cm * 10.0 - BASE_MM) * 10.0).round().max(0.0) as u16
 }
 
+fn parse_height(data: &[u8]) -> Result<Height> {
+    if data.len() < 4 {
+        return Err("위치 데이터가 4바이트 미만".into());
+    }
+    let raw = u16::from_le_bytes([data[0], data[1]]);
+    let speed = i16::from_le_bytes([data[2], data[3]]);
+    Ok(Height {
+        cm: (BASE_MM + raw as f32 / 10.0) / 10.0,
+        raw,
+        speed,
+    })
+}
+
 pub struct Desk {
     peripheral: Peripheral,
     pos_char: btleplug::api::Characteristic,
@@ -72,9 +85,9 @@ impl Desk {
 
         central.start_scan(ScanFilter::default()).await?;
         let mut found = None;
-        let tries = (timeout.as_millis() / 500).max(1);
+        let tries = (timeout.as_millis() / 200).max(1);
         'scan: for _ in 0..tries {
-            time::sleep(Duration::from_millis(500)).await;
+            time::sleep(Duration::from_millis(200)).await;
             for p in central.peripherals().await? {
                 if let Some(props) = p.properties().await? {
                     if let Some(name) = props.local_name {
@@ -157,17 +170,19 @@ impl Desk {
     }
 
     pub async fn height(&self) -> Result<Height> {
-        let data = self.peripheral.read(&self.pos_char).await?;
-        if data.len() < 4 {
-            return Err("위치 데이터가 4바이트 미만".into());
-        }
-        let raw = u16::from_le_bytes([data[0], data[1]]);
-        let speed = i16::from_le_bytes([data[2], data[3]]);
-        Ok(Height {
-            cm: (BASE_MM + raw as f32 / 10.0) / 10.0,
-            raw,
-            speed,
-        })
+        parse_height(&self.peripheral.read(&self.pos_char).await?)
+    }
+
+    /// 위치 notify 구독 — 물리 스위치 조작을 포함해 책상이 움직이는 동안
+    /// 실시간 높이가 흘러나오는 스트림을 반환한다. 연결이 끊기면 스트림도 끝난다.
+    pub async fn subscribe_height(&self) -> Result<impl futures::Stream<Item = Height> + Send> {
+        self.peripheral.subscribe(&self.pos_char).await?;
+        let notifs = self.peripheral.notifications().await?;
+        Ok(notifs.filter_map(|n| async move {
+            (n.uuid == POS_CHAR)
+                .then(|| parse_height(&n.value).ok())
+                .flatten()
+        }))
     }
 
     /// 목표 높이(cm)까지 이동하고 최종 높이를 반환한다.
