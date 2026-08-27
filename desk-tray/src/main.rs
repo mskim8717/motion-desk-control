@@ -9,8 +9,8 @@ mod panel;
 use config::Config;
 use desk_core::Desk;
 use futures::StreamExt;
-use std::sync::mpsc;
 use std::sync::{Arc, Mutex};
+use tokio::sync::mpsc;
 use std::time::{Duration, Instant};
 use tao::dpi::{LogicalPosition, LogicalSize};
 use tao::event::{Event, StartCause, WindowEvent};
@@ -110,7 +110,7 @@ fn main() {
     }));
 
     // BLE 백그라운드 스레드
-    let (cmd_tx, cmd_rx) = mpsc::channel::<DeskCmd>();
+    let (cmd_tx, cmd_rx) = mpsc::unbounded_channel::<DeskCmd>();
     let ble_proxy = event_loop.create_proxy();
     std::thread::spawn(move || ble_thread(cmd_rx, ble_proxy));
     let _ = cmd_tx.send(DeskCmd::Refresh); // 시작하자마자 연결 + 높이 표시
@@ -332,111 +332,162 @@ fn open_panel(
 }
 
 /// BLE 전담 스레드: 명령 채널을 소비하며 결과를 사용자 이벤트로 보고한다.
-fn ble_thread(cmd_rx: mpsc::Receiver<DeskCmd>, proxy: EventLoopProxy<UserEvent>) {
+/// 이동(move_to)은 별도 태스크로 돌리므로, 이동 중에도 새 명령(다른 프리셋,
+/// 정지)이 즉시 처리되어 진행 중인 이동을 중단시킨다.
+fn ble_thread(mut cmd_rx: mpsc::UnboundedReceiver<DeskCmd>, proxy: EventLoopProxy<UserEvent>) {
     let rt = tokio::runtime::Runtime::new().expect("tokio 런타임 생성 실패");
-    let title = |s: String| {
-        let _ = proxy.send_event(UserEvent::Title(s));
-    };
-    let conn = |s: ConnState| {
-        let _ = proxy.send_event(UserEvent::Conn(s));
-    };
+    rt.block_on(async move {
+        let title = |s: String| {
+            let _ = proxy.send_event(UserEvent::Title(s));
+        };
+        let conn = |s: ConnState| {
+            let _ = proxy.send_event(UserEvent::Conn(s));
+        };
 
-    let mut desk: Option<Desk> = None;
-    // 마지막으로 알려진 높이 — notify 태스크가 갱신, 하트비트 태스크가 기록
-    let last_cm: Arc<Mutex<Option<f32>>> = Arc::new(Mutex::new(None));
-    {
-        // 5분마다 현재 높이를 이력에 기록 (움직임이 없어도 차트가 이어지도록)
-        let last_cm = last_cm.clone();
-        rt.spawn(async move {
-            let mut tick = tokio::time::interval(Duration::from_secs(300));
-            tick.tick().await; // 첫 틱은 즉시 발화하므로 건너뜀
-            loop {
-                tick.tick().await;
-                if let Some(cm) = *last_cm.lock().unwrap() {
-                    history::append(cm);
-                }
-            }
-        });
-    }
+        let mut desk: Option<Arc<Desk>> = None;
+        // 진행 중인 이동 태스크 — 새 이동/정지 명령이 오면 abort
+        let mut mover: Option<tokio::task::JoinHandle<()>> = None;
+        // 이동 태스크에서 통신 오류가 났을 때 연결을 버리라는 신호
+        let (dead_tx, mut dead_rx) = mpsc::unbounded_channel::<()>();
 
-    while let Ok(cmd) = cmd_rx.recv() {
-        // 연결이 없으면 먼저 연결 시도
-        if desk.is_none() {
-            title("↕ 연결 중...".into());
-            conn(ConnState::Connecting);
-            match rt.block_on(Desk::connect(SCAN_TIMEOUT)) {
-                Ok(d) => {
-                    // 연결 시점 높이를 이력에 기록
-                    if let Ok(h) = rt.block_on(d.height()) {
-                        history::append(h.cm);
-                        *last_cm.lock().unwrap() = Some(h.cm);
+        // 마지막으로 알려진 높이 — notify 태스크가 갱신, 하트비트 태스크가 기록
+        let last_cm: Arc<Mutex<Option<f32>>> = Arc::new(Mutex::new(None));
+        {
+            // 5분마다 현재 높이를 이력에 기록 (움직임이 없어도 차트가 이어지도록)
+            let last_cm = last_cm.clone();
+            tokio::spawn(async move {
+                let mut tick = tokio::time::interval(Duration::from_secs(300));
+                tick.tick().await; // 첫 틱은 즉시 발화하므로 건너뜀
+                loop {
+                    tick.tick().await;
+                    if let Some(cm) = *last_cm.lock().unwrap() {
+                        history::append(cm);
                     }
-                    // 위치 notify 구독: 물리 스위치로 움직여도 높이가 실시간 갱신됨
-                    match rt.block_on(d.subscribe_height()) {
-                        Ok(stream) => {
-                            let p = proxy.clone();
-                            let last_cm = last_cm.clone();
-                            rt.spawn(async move {
-                                let mut stream = Box::pin(stream);
-                                let mut last_logged: Option<(i64, u16)> = None;
-                                while let Some(h) = stream.next().await {
-                                    let _ = p.send_event(UserEvent::Title(format!(
-                                        "↕ {:.0}cm",
-                                        h.cm
-                                    )));
+                }
+            });
+        }
+
+        loop {
+            tokio::select! {
+                maybe_cmd = cmd_rx.recv() => {
+                    let Some(cmd) = maybe_cmd else { break };
+
+                    // 연결이 없으면 먼저 연결 시도
+                    if desk.is_none() {
+                        title("↕ 연결 중...".into());
+                        conn(ConnState::Connecting);
+                        match Desk::connect(SCAN_TIMEOUT).await {
+                            Ok(d) => {
+                                // 연결 시점 높이를 이력에 기록
+                                if let Ok(h) = d.height().await {
+                                    history::append(h.cm);
                                     *last_cm.lock().unwrap() = Some(h.cm);
-                                    // 이동 중 이력: raw가 바뀌었을 때 초당 1회로 제한
-                                    let ts = history::now_ts();
-                                    let changed = last_logged
-                                        .map(|(t, raw)| raw != h.raw && ts > t)
-                                        .unwrap_or(true);
-                                    if changed {
-                                        history::append(h.cm);
-                                        last_logged = Some((ts, h.raw));
+                                }
+                                // 위치 notify 구독: 물리 스위치 조작도 실시간 반영
+                                match d.subscribe_height().await {
+                                    Ok(stream) => {
+                                        let p = proxy.clone();
+                                        let last_cm = last_cm.clone();
+                                        tokio::spawn(async move {
+                                            let mut stream = Box::pin(stream);
+                                            let mut last_logged: Option<(i64, u16)> = None;
+                                            while let Some(h) = stream.next().await {
+                                                let _ = p.send_event(UserEvent::Title(
+                                                    format!("↕ {:.0}cm", h.cm),
+                                                ));
+                                                *last_cm.lock().unwrap() = Some(h.cm);
+                                                // 이동 중 이력: raw 변화 시 초당 1회
+                                                let ts = history::now_ts();
+                                                let changed = last_logged
+                                                    .map(|(t, raw)| raw != h.raw && ts > t)
+                                                    .unwrap_or(true);
+                                                if changed {
+                                                    history::append(h.cm);
+                                                    last_logged = Some((ts, h.raw));
+                                                }
+                                            }
+                                        });
+                                    }
+                                    Err(e) => eprintln!("높이 알림 구독 실패: {}", e),
+                                }
+                                desk = Some(Arc::new(d));
+                                conn(ConnState::Connected);
+                            }
+                            Err(e) => {
+                                eprintln!("연결 실패: {}", e);
+                                title("↕ 연결 안 됨".into());
+                                conn(ConnState::Disconnected);
+                                continue;
+                            }
+                        }
+                    }
+                    let d = desk.clone().unwrap();
+
+                    match cmd {
+                        DeskCmd::GoTo(cm) => {
+                            // 진행 중인 이동이 있으면 중단하고 새 목표로 교체
+                            if let Some(m) = mover.take() {
+                                m.abort();
+                            }
+                            title(format!("↕ {:.0}cm로 이동 중...", cm));
+                            let p = proxy.clone();
+                            let dead = dead_tx.clone();
+                            mover = Some(tokio::spawn(async move {
+                                match d.move_to(cm).await {
+                                    Ok(h) => {
+                                        let _ = p.send_event(UserEvent::Title(format!(
+                                            "↕ {:.0}cm",
+                                            h.cm
+                                        )));
+                                    }
+                                    Err(e) => {
+                                        eprintln!("이동 실패: {}", e);
+                                        let _ = dead.send(());
                                     }
                                 }
-                            });
+                            }));
                         }
-                        Err(e) => eprintln!("높이 알림 구독 실패: {}", e),
+                        DeskCmd::Stop => {
+                            if let Some(m) = mover.take() {
+                                m.abort();
+                            }
+                            match d.stop().await.and(d.height().await) {
+                                Ok(h) => title(format!("↕ {:.0}cm", h.cm)),
+                                Err(e) => {
+                                    eprintln!("정지 실패: {}", e);
+                                    let _ = dead_tx.send(());
+                                }
+                            }
+                        }
+                        DeskCmd::Refresh => match d.height().await {
+                            Ok(h) => title(format!("↕ {:.0}cm", h.cm)),
+                            Err(e) => {
+                                eprintln!("높이 읽기 실패: {}", e);
+                                let _ = dead_tx.send(());
+                            }
+                        },
+                        DeskCmd::SaveSlot(slot) => match d.height().await {
+                            Ok(h) => {
+                                let _ = proxy.send_event(UserEvent::SlotSaved(slot, h.cm));
+                                title(format!("↕ {:.0}cm", h.cm));
+                            }
+                            Err(e) => {
+                                eprintln!("높이 읽기 실패: {}", e);
+                                let _ = dead_tx.send(());
+                            }
+                        },
                     }
-                    desk = Some(d);
-                    conn(ConnState::Connected);
                 }
-                Err(e) => {
-                    eprintln!("연결 실패: {}", e);
+                Some(_) = dead_rx.recv() => {
+                    // 통신 오류 → 연결을 버리고 다음 명령에서 재연결
+                    if let Some(m) = mover.take() {
+                        m.abort();
+                    }
+                    desk = None;
                     title("↕ 연결 안 됨".into());
                     conn(ConnState::Disconnected);
-                    continue;
                 }
             }
         }
-        let d = desk.as_ref().unwrap();
-
-        let result = rt.block_on(async {
-            match cmd {
-                DeskCmd::GoTo(cm) => {
-                    title(format!("↕ {:.0}cm로 이동 중...", cm));
-                    d.move_to(cm).await.map(Some)
-                }
-                DeskCmd::Stop => d.stop().await.and(d.height().await).map(Some),
-                DeskCmd::Refresh => d.height().await.map(Some),
-                DeskCmd::SaveSlot(slot) => d.height().await.map(|h| {
-                    let _ = proxy.send_event(UserEvent::SlotSaved(slot, h.cm));
-                    Some(h)
-                }),
-            }
-        });
-
-        match result {
-            Ok(Some(h)) => title(format!("↕ {:.0}cm", h.cm)),
-            Ok(None) => {}
-            Err(e) => {
-                // 연결이 죽었을 가능성이 높음 → 버리고 다음 명령에서 재연결
-                eprintln!("명령 실패: {}", e);
-                desk = None;
-                title("↕ 연결 안 됨".into());
-                conn(ConnState::Disconnected);
-            }
-        }
-    }
+    });
 }
