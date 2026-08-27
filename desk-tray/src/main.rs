@@ -21,7 +21,7 @@ use tray_icon::menu::{Menu, MenuEvent, MenuItem, PredefinedMenuItem, Submenu};
 use tray_icon::{MouseButton, MouseButtonState, TrayIcon, TrayIconBuilder, TrayIconEvent};
 
 const SCAN_TIMEOUT: Duration = Duration::from_secs(30);
-const PANEL_W: f64 = 360.0;
+const PANEL_W: f64 = 300.0;
 const PANEL_H: f64 = 400.0;
 
 #[derive(Debug, Clone, Copy, PartialEq)]

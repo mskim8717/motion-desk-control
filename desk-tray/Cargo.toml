@@ -20,4 +20,5 @@ tray-icon = "0.21"
 tao = "0.34"
 serde = { version = "1", features = ["derive"] }
 toml = "0.8"
-wry = "0.53"
+# transparent feature: macOS에서 웹뷰 배경 투명화 (팝오버 둥근 모서리에 필요)
+wry = { version = "0.53", features = ["transparent"] }
