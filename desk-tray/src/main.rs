@@ -21,7 +21,7 @@ use tray_icon::menu::{Menu, MenuEvent, MenuItem, PredefinedMenuItem, Submenu};
 use tray_icon::{MouseButton, MouseButtonState, TrayIcon, TrayIconBuilder, TrayIconEvent};
 
 const SCAN_TIMEOUT: Duration = Duration::from_secs(30);
-const PANEL_W: f64 = 300.0;
+const PANEL_W: f64 = 260.0;
 const PANEL_H: f64 = 400.0;
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -191,8 +191,8 @@ fn main() {
                         let state = panel::PanelState {
                             big: cur_title.trim_start_matches("↕ "),
                             connected: cur_conn == ConnState::Connected,
-                            sit_label: cfg.sit.map(|cm| Slot::Sit.label(Some(cm))),
-                            stand_label: cfg.stand.map(|cm| Slot::Stand.label(Some(cm))),
+                            sit_label: cfg.sit.map(|_| "앉기".to_string()),
+                            stand_label: cfg.stand.map(|_| "서기".to_string()),
                             samples: &history::load_recent(86400),
                             threshold_cm: standing_threshold(&cfg),
                         };

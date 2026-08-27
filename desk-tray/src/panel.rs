@@ -22,11 +22,11 @@ pub fn html(s: &PanelState) -> String {
         .join(",");
     let (sit_label, sit_ok) = match &s.sit_label {
         Some(l) => (l.clone(), true),
-        None => ("① 앉기 (미설정)".into(), false),
+        None => ("앉기".into(), false),
     };
     let (stand_label, stand_ok) = match &s.stand_label {
         Some(l) => (l.clone(), true),
-        None => ("② 서기 (미설정)".into(), false),
+        None => ("서기".into(), false),
     };
     format!(
         r##"<!doctype html><html><head><meta charset="utf-8"><style>
@@ -35,11 +35,13 @@ font:13px -apple-system,'Apple SD Gothic Neo',sans-serif;overflow:hidden;
 -webkit-user-select:none;user-select:none}}
 #wrap{{position:fixed;inset:0;background:rgba(28,28,30,.97);border-radius:14px;
 border:1px solid rgba(255,255,255,.12);overflow:hidden;display:flex;flex-direction:column}}
-#big{{text-align:center;font-size:40px;font-weight:700;margin-top:22px}}
-#status{{text-align:center;color:#98989d;margin-top:2px}}
-#btns{{display:flex;gap:8px;padding:16px 16px 4px}}
-button{{flex:1;padding:9px 4px;border:0;border-radius:9px;background:#3a3a3c;color:#e5e5e7;
-font:13px -apple-system,'Apple SD Gothic Neo',sans-serif;cursor:default}}
+#big{{display:flex;align-items:center;justify-content:center;height:46px;margin-top:16px;
+font-size:38px;font-weight:700}}
+#big.small{{font-size:15px;font-weight:600;color:#98989d}}
+#status{{text-align:center;color:#98989d;margin-top:2px;font-size:11px}}
+#btns{{display:flex;gap:6px;padding:12px 14px 2px}}
+button{{flex:1;padding:8px 2px;border:0;border-radius:8px;background:#3a3a3c;color:#e5e5e7;
+font:12px -apple-system,'Apple SD Gothic Neo',sans-serif;cursor:default;white-space:nowrap}}
 button:active{{background:#0a84ff}}
 button:disabled{{opacity:.35}}
 .label{{text-align:center;color:#98989d;font-size:11px;margin:12px 0 4px;
@@ -48,7 +50,7 @@ display:flex;align-items:center;gap:10px;padding:0 16px}}
 canvas{{display:block}}
 #summary{{text-align:center;color:#98989d;padding:6px 0 12px}}
 </style></head><body><div id="wrap">
-<div id="big">{big}</div><div id="status"></div>
+<div id="big"></div><div id="status"></div>
 <div id="btns">
 <button id="bsit" onclick="cmd('sit')">{sit_label}</button>
 <button id="bstand" onclick="cmd('stand')">{stand_label}</button>
@@ -64,7 +66,9 @@ let CONN={connected};
 const cv=document.getElementById('c'),ctx=cv.getContext('2d');
 const $=id=>document.getElementById(id);
 function cmd(c){{if(CONN)window.ipc.postMessage(c)}}
-function setTitle(t){{$('big').textContent=t}}
+// 높이 숫자("78cm")만 크게, 상태 문구("연결 중..." 등)는 작게
+function setTitle(t){{const el=$('big');el.textContent=t;
+el.classList.toggle('small',!/^[0-9]+cm$/.test(t))}}
 function setConn(c,label){{CONN=c;$('status').textContent=label;
 $('bsit').disabled=!c||!SIT_OK;$('bstand').disabled=!c||!STAND_OK;$('bstop').disabled=!c}}
 function fmt(s){{const h=Math.floor(s/3600),m=Math.round(s%3600/60);return (h?h+'시간 ':'')+m+'분'}}
@@ -110,6 +114,7 @@ function draw(){{
   ctx.fillStyle='rgba(10,132,255,.28)';ctx.fill();
 }}
 addEventListener('resize',draw);draw();
+setTitle('{big}');
 setConn(CONN,CONN?'연결됨':'연결 안 됨');
 </script></body></html>"##,
         big = s.big,
