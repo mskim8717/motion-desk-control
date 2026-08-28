@@ -22,7 +22,7 @@ use tray_icon::{MouseButton, MouseButtonState, TrayIcon, TrayIconBuilder, TrayIc
 
 const SCAN_TIMEOUT: Duration = Duration::from_secs(30);
 const PANEL_W: f64 = 260.0;
-const PANEL_H: f64 = 400.0;
+const PANEL_H: f64 = 290.0;
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 enum Slot {

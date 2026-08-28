@@ -35,20 +35,20 @@ font:13px -apple-system,'Apple SD Gothic Neo',sans-serif;overflow:hidden;
 -webkit-user-select:none;user-select:none}}
 #wrap{{position:fixed;inset:0;background:rgba(28,28,30,.97);border-radius:14px;
 border:1px solid rgba(255,255,255,.12);overflow:hidden;display:flex;flex-direction:column}}
-#big{{display:flex;align-items:center;justify-content:center;height:46px;margin-top:16px;
-font-size:38px;font-weight:700}}
-#big.small{{font-size:15px;font-weight:600;color:#98989d}}
-#status{{text-align:center;color:#98989d;margin-top:2px;font-size:11px}}
-#btns{{display:flex;gap:6px;padding:12px 14px 2px}}
-button{{flex:1;padding:8px 2px;border:0;border-radius:8px;background:#3a3a3c;color:#e5e5e7;
+#big{{display:flex;align-items:center;justify-content:center;height:38px;margin-top:8px;
+font-size:32px;font-weight:700}}
+#big.small{{font-size:14px;font-weight:600;color:#98989d}}
+#status{{text-align:center;color:#98989d;font-size:10px;height:13px}}
+#btns{{display:flex;gap:6px;padding:8px 12px 0}}
+button{{flex:1;padding:7px 2px;border:0;border-radius:8px;background:#3a3a3c;color:#e5e5e7;
 font:12px -apple-system,'Apple SD Gothic Neo',sans-serif;cursor:default;white-space:nowrap}}
 button:active{{background:#0a84ff}}
 button:disabled{{opacity:.35}}
-.label{{text-align:center;color:#98989d;font-size:11px;margin:12px 0 4px;
-display:flex;align-items:center;gap:10px;padding:0 16px}}
+.label{{text-align:center;color:#98989d;font-size:10px;margin:8px 0 2px;
+display:flex;align-items:center;gap:8px;padding:0 14px}}
 .label:before,.label:after{{content:'';flex:1;height:1px;background:#3a3a3c}}
 canvas{{display:block}}
-#summary{{text-align:center;color:#98989d;padding:6px 0 12px}}
+#summary{{text-align:center;color:#98989d;font-size:11px;padding:2px 0 8px}}
 </style></head><body><div id="wrap">
 <div id="big"></div><div id="status"></div>
 <div id="btns">
@@ -66,9 +66,10 @@ let CONN={connected};
 const cv=document.getElementById('c'),ctx=cv.getContext('2d');
 const $=id=>document.getElementById(id);
 function cmd(c){{if(CONN)window.ipc.postMessage(c)}}
-// 높이 숫자("78cm")만 크게, 상태 문구("연결 중..." 등)는 작게
-function setTitle(t){{const el=$('big');el.textContent=t;
-el.classList.toggle('small',!/^[0-9]+cm$/.test(t))}}
+// 높이 숫자("78cm")만 크게, 상태 문구("연결 중..." 등)는 작게.
+// 상태 문구일 때는 아래 status 줄과 중복되므로 status를 숨긴다.
+function setTitle(t){{const el=$('big'),h=/^[0-9]+cm$/.test(t);el.textContent=t;
+el.classList.toggle('small',!h);$('status').style.visibility=h?'visible':'hidden'}}
 function setConn(c,label){{CONN=c;$('status').textContent=label;
 $('bsit').disabled=!c||!SIT_OK;$('bstand').disabled=!c||!STAND_OK;$('bstop').disabled=!c}}
 function fmt(s){{const h=Math.floor(s/3600),m=Math.round(s%3600/60);return (h?h+'시간 ':'')+m+'분'}}
@@ -83,9 +84,9 @@ function fmt(s){{const h=Math.floor(s/3600),m=Math.round(s%3600/60);return (h?h+
 }})();
 function draw(){{
   const NOW=Date.now()/1000,FROM=NOW-86400;
-  const W=innerWidth-32,H=150,dpr=devicePixelRatio||1;
+  const W=innerWidth-28,H=120,dpr=devicePixelRatio||1;
   cv.width=W*dpr;cv.height=H*dpr;cv.style.width=W+'px';cv.style.height=H+'px';
-  cv.style.marginLeft='16px';
+  cv.style.marginLeft='14px';
   ctx.setTransform(dpr,0,0,dpr,0,0);ctx.clearRect(0,0,W,H);
   const L=26,R=2,T=6,B=18,pw=W-L-R,ph=H-T-B;
   const Y0=60,Y1=130;
