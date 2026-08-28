@@ -17,12 +17,11 @@ use tao::event::{Event, StartCause, WindowEvent};
 use tao::event_loop::{ControlFlow, EventLoopBuilder, EventLoopProxy, EventLoopWindowTarget};
 use tao::platform::macos::{ActivationPolicy, EventLoopExtMacOS};
 use tao::window::{Window, WindowBuilder};
-use tray_icon::menu::{Menu, MenuEvent, MenuItem, PredefinedMenuItem, Submenu};
 use tray_icon::{MouseButton, MouseButtonState, TrayIcon, TrayIconBuilder, TrayIconEvent};
 
 const SCAN_TIMEOUT: Duration = Duration::from_secs(30);
 const PANEL_W: f64 = 260.0;
-const PANEL_H: f64 = 290.0;
+const PANEL_H: f64 = 312.0;
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 enum Slot {
@@ -30,14 +29,6 @@ enum Slot {
     Stand,
 }
 
-impl Slot {
-    fn name(self) -> &'static str {
-        match self {
-            Slot::Sit => "① 앉기",
-            Slot::Stand => "② 서기",
-        }
-    }
-}
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 enum ConnState {
@@ -61,7 +52,6 @@ impl ConnState {
 
 #[derive(Debug)]
 enum UserEvent {
-    Menu(MenuEvent),
     /// 트레이 아이콘 좌클릭 — 패널 토글
     TrayClick,
     /// 패널 버튼 (sit | stand | stop)
@@ -85,11 +75,7 @@ fn main() {
     let mut event_loop = EventLoopBuilder::<UserEvent>::with_user_event().build();
     event_loop.set_activation_policy(ActivationPolicy::Accessory); // 독 아이콘 숨김 (메뉴바 전용)
 
-    // 메뉴/트레이 이벤트 → 이벤트 루프로 전달
-    let proxy = event_loop.create_proxy();
-    MenuEvent::set_event_handler(Some(move |e: MenuEvent| {
-        let _ = proxy.send_event(UserEvent::Menu(e));
-    }));
+    // 트레이 이벤트 → 이벤트 루프로 전달 (좌클릭만, 우클릭은 무시)
     let proxy = event_loop.create_proxy();
     TrayIconEvent::set_event_handler(Some(move |e: TrayIconEvent| {
         if let TrayIconEvent::Click {
@@ -110,32 +96,6 @@ fn main() {
 
     let mut cfg = Config::load();
 
-    // 우클릭 보조 메뉴 (좌클릭은 패널)
-    let save_sit_item = MenuItem::new("현재 높이를 ①로 저장", false, None);
-    let save_stand_item = MenuItem::new("현재 높이를 ②로 저장", false, None);
-    let reset_sit_item = MenuItem::new(Slot::Sit.name(), cfg.sit.is_some(), None);
-    let reset_stand_item = MenuItem::new(Slot::Stand.name(), cfg.stand.is_some(), None);
-    let reset_menu = Submenu::with_items(
-        "프리셋 초기화",
-        true,
-        &[&reset_sit_item, &reset_stand_item],
-    )
-    .expect("초기화 서브메뉴 구성 실패");
-    let refresh_item = MenuItem::new("새로고침", false, None);
-    let quit_item = MenuItem::new("종료", true, None);
-
-    let menu = Menu::new();
-    menu.append_items(&[
-        &save_sit_item,
-        &save_stand_item,
-        &reset_menu,
-        &PredefinedMenuItem::separator(),
-        &refresh_item,
-        &PredefinedMenuItem::separator(),
-        &quit_item,
-    ])
-    .expect("메뉴 구성 실패");
-
     // macOS에서는 이벤트 루프 시작 후에 트레이 아이콘을 만들어야 함
     let mut tray: Option<TrayIcon> = None;
     // 팝오버 패널 (열려 있는 동안만 Some)
@@ -155,8 +115,6 @@ fn main() {
                 tray = Some(
                     TrayIconBuilder::new()
                         .with_title(&cur_title)
-                        .with_menu(Box::new(menu.clone()))
-                        .with_menu_on_left_click(false)
                         .build()
                         .expect("트레이 아이콘 생성 실패"),
                 );
@@ -207,6 +165,12 @@ fn main() {
                     "stop" => Some(DeskCmd::Stop),
                     "save_sit" => Some(DeskCmd::SaveSlot(Slot::Sit)),
                     "save_stand" => Some(DeskCmd::SaveSlot(Slot::Stand)),
+                    "refresh" => Some(DeskCmd::Refresh),
+                    "quit" => {
+                        // 프로세스 종료 시 BLE 연결이 끊기고 책상은 자동 정지함 (데드맨)
+                        *control_flow = ControlFlow::Exit;
+                        None
+                    }
                     _ => None,
                 };
                 if let Some(cmd) = cmd {
@@ -226,10 +190,6 @@ fn main() {
             Event::UserEvent(UserEvent::Conn(state)) => {
                 cur_conn = state;
                 let connected = state == ConnState::Connected;
-                save_sit_item.set_enabled(connected);
-                save_stand_item.set_enabled(connected);
-                // 새로고침은 끊김 상태에서 재연결 버튼을 겸함 — 연결 시도 중에만 비활성
-                refresh_item.set_enabled(state != ConnState::Connecting);
                 if let Some((_, wv)) = &panel_win {
                     let _ = wv.evaluate_script(&format!(
                         "setConn({},'{}')",
@@ -239,47 +199,18 @@ fn main() {
                 }
             }
             Event::UserEvent(UserEvent::SlotSaved(slot, cm)) => {
-                let (field, reset_item) = match slot {
-                    Slot::Sit => (&mut cfg.sit, &reset_sit_item),
-                    Slot::Stand => (&mut cfg.stand, &reset_stand_item),
+                let field = match slot {
+                    Slot::Sit => &mut cfg.sit,
+                    Slot::Stand => &mut cfg.stand,
                 };
                 *field = Some(cm);
                 cfg.save();
-                reset_item.set_enabled(true);
                 if let Some((_, wv)) = &panel_win {
                     let _ = wv.evaluate_script(&format!(
                         "setPresets({},{})",
                         cfg.sit.is_some(),
                         cfg.stand.is_some()
                     ));
-                }
-            }
-            Event::UserEvent(UserEvent::Menu(e)) => {
-                let cmd = if e.id() == save_sit_item.id() {
-                    Some(DeskCmd::SaveSlot(Slot::Sit))
-                } else if e.id() == save_stand_item.id() {
-                    Some(DeskCmd::SaveSlot(Slot::Stand))
-                } else if e.id() == reset_sit_item.id() || e.id() == reset_stand_item.id() {
-                    let (field, reset_item) = if e.id() == reset_sit_item.id() {
-                        (&mut cfg.sit, &reset_sit_item)
-                    } else {
-                        (&mut cfg.stand, &reset_stand_item)
-                    };
-                    *field = None;
-                    cfg.save();
-                    reset_item.set_enabled(false);
-                    None
-                } else if e.id() == refresh_item.id() {
-                    Some(DeskCmd::Refresh)
-                } else if e.id() == quit_item.id() {
-                    // 프로세스 종료 시 BLE 연결이 끊기고 책상은 자동 정지함 (데드맨)
-                    *control_flow = ControlFlow::Exit;
-                    None
-                } else {
-                    None
-                };
-                if let Some(cmd) = cmd {
-                    let _ = cmd_tx.send(cmd);
                 }
             }
             _ => {}

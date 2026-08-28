@@ -48,7 +48,10 @@ button:disabled{{opacity:.35}}
 display:flex;align-items:center;gap:8px;padding:0 14px}}
 .label:before,.label:after{{content:'';flex:1;height:1px;background:#3a3a3c}}
 canvas{{display:block}}
-#summary{{text-align:center;color:#98989d;font-size:11px;padding:2px 0 8px}}
+#summary{{text-align:center;color:#98989d;font-size:11px;padding:2px 0 4px}}
+#foot{{display:flex;justify-content:space-between;padding:2px 10px 8px}}
+#foot button{{background:none;color:#98989d;font-size:11px;padding:3px 6px}}
+#foot button:active:not(:disabled){{background:none;color:#e5e5e7}}
 </style></head><body><div id="wrap">
 <div id="toprow">
 <div id="big"></div>
@@ -68,6 +71,10 @@ canvas{{display:block}}
 <div class="label">사용 기록 (24시간)</div>
 <canvas id="c"></canvas>
 <div id="summary"></div>
+<div id="foot">
+<button id="brefresh" onclick="window.ipc.postMessage('refresh')">새로고침</button>
+<button onclick="window.ipc.postMessage('quit')">종료</button>
+</div>
 </div>
 <script>
 const DATA=[{data}],TH={threshold};
@@ -88,11 +95,15 @@ function setTitle(t){{const el=$('big'),h=/^[0-9]+cm$/.test(t);el.textContent=t;
 el.classList.toggle('small',!h);$('status').style.visibility=h?'visible':'hidden'}}
 function setPresets(sit,stand){{SIT=sit;STAND=stand;
 $('ssit').textContent=sit?'★':'☆';$('sstand').textContent=stand?'★':'☆';apply()}}
-function setConn(c,label){{CONN=c;$('status').textContent=label;apply()}}
+let CONNECTING=false;
+function setConn(c,label){{CONN=c;CONNECTING=label==='연결 중...';
+$('status').textContent=label;apply()}}
 function apply(){{
 $('bsit').disabled=!CONN||!SIT;$('bstand').disabled=!CONN||!STAND;
 $('bstop').disabled=!CONN;$('bup').disabled=!CONN;$('bdn').disabled=!CONN;
-$('ssit').disabled=!CONN;$('sstand').disabled=!CONN}}
+$('ssit').disabled=!CONN;$('sstand').disabled=!CONN;
+// 새로고침은 끊김 상태에서 재연결 버튼을 겸함 — 연결 시도 중에만 비활성
+$('brefresh').disabled=CONNECTING}}
 function fmt(s){{const h=Math.floor(s/3600),m=Math.round(s%3600/60);return (h?h+'시간 ':'')+m+'분'}}
 (function(){{
   if(!DATA.length){{$('summary').textContent='아직 기록이 없습니다';return}}
