@@ -1,12 +1,12 @@
 // 통합 팝오버 패널 HTML (웹뷰용) — 현재 높이 + ▲▼ 홀드 이동 + 프리셋 + 사용 기록 차트.
 // 버튼은 window.ipc.postMessage(...)로 Rust에 전달되고,
-// Rust는 setTitle()/setConn()/setPresets()를 evaluate_script로 호출해 상태를 갱신한다.
+// Rust는 setTitle()/setConn()/setFavs()를 evaluate_script로 호출해 상태를 갱신한다.
 pub struct PanelState<'a> {
     /// 큰 글씨로 표시할 텍스트 (예: "78cm", "연결 중...")
     pub big: &'a str,
     pub connected: bool,
-    pub sit_set: bool,
-    pub stand_set: bool,
+    /// 즐겨찾기 슬롯 (미설정 = None)
+    pub favs: [Option<f32>; 3],
     /// (unix초, cm) 샘플
     pub samples: &'a [(i64, f32)],
     /// 서기 판정 기준 높이
@@ -18,6 +18,12 @@ pub fn html(s: &PanelState) -> String {
         .samples
         .iter()
         .map(|(t, c)| format!("[{},{:.1}]", t, c))
+        .collect::<Vec<_>>()
+        .join(",");
+    let favs = s
+        .favs
+        .iter()
+        .map(|f| f.map(|v| format!("{:.1}", v)).unwrap_or_else(|| "null".into()))
         .collect::<Vec<_>>()
         .join(",");
     format!(
@@ -35,11 +41,8 @@ border:1px solid rgba(255,255,255,.12);overflow:hidden;display:flex;flex-directi
 color:#e5e5e7;font-size:11px;line-height:20px;cursor:default}}
 #status{{text-align:center;color:#98989d;font-size:10px;height:13px}}
 #btns{{display:flex;gap:6px;padding:8px 12px 0}}
-.btnw{{flex:1.4;display:flex}}
-.btnw button:first-child{{flex:1;border-radius:8px 0 0 8px}}
-.btnw .star{{width:26px;border-radius:0 8px 8px 0;border-left:1px solid rgba(0,0,0,.35);
-color:#ffd60a;font-size:13px}}
-#bstop{{flex:1}}
+#btns button{{flex:1}}
+.st{{color:#ffd60a}}
 button{{padding:7px 2px;border:0;border-radius:8px;background:#3a3a3c;color:#e5e5e7;
 font:12px -apple-system,'Apple SD Gothic Neo',sans-serif;cursor:default;white-space:nowrap}}
 button:active:not(:disabled){{background:#0a84ff}}
@@ -62,10 +65,9 @@ canvas{{display:block}}
 </div>
 <div id="status"></div>
 <div id="btns">
-<div class="btnw"><button id="bsit" onclick="cmd('sit')">앉기</button><button
- id="ssit" class="star" onclick="cmd('save_sit')">☆</button></div>
-<div class="btnw"><button id="bstand" onclick="cmd('stand')">서기</button><button
- id="sstand" class="star" onclick="cmd('save_stand')">☆</button></div>
+<button id="f0" title="길게 눌러 현재 높이 저장"></button>
+<button id="f1" title="길게 눌러 현재 높이 저장"></button>
+<button id="f2" title="길게 눌러 현재 높이 저장"></button>
 <button id="bstop" onclick="cmd('stop')">정지</button>
 </div>
 <div class="label">사용 기록 (24시간)</div>
@@ -78,7 +80,7 @@ canvas{{display:block}}
 </div>
 <script>
 const DATA=[{data}],TH={threshold};
-let CONN={connected},SIT={sit_set},STAND={stand_set};
+let CONN={connected},FAVS=[{favs}];
 const cv=document.getElementById('c'),ctx=cv.getContext('2d');
 const $=id=>document.getElementById(id);
 function cmd(c){{if(CONN)window.ipc.postMessage(c)}}
@@ -93,15 +95,26 @@ for(const [id,m] of [['bup','up'],['bdn','down']]){{
 // 상태 문구일 때는 아래 status 줄과 중복되므로 status를 숨긴다.
 function setTitle(t){{const el=$('big'),h=/^[0-9]+cm$/.test(t);el.textContent=t;
 el.classList.toggle('small',!h);$('status').style.visibility=h?'visible':'hidden'}}
-function setPresets(sit,stand){{SIT=sit;STAND=stand;
-$('ssit').textContent=sit?'★':'☆';$('sstand').textContent=stand?'★':'☆';apply()}}
+// 즐겨찾기: 클릭 = 이동(빈 슬롯이면 저장), 길게(0.6초) = 현재 높이 저장
+function setFavs(f){{FAVS=f;
+for(let i=0;i<3;i++){{const b=$('f'+i);
+b.innerHTML=FAVS[i]!=null?'<span class="st">★</span> '+Math.round(FAVS[i]):'<span class="st">☆</span>'}}
+apply()}}
+for(let i=0;i<3;i++){{
+  const b=$('f'+i);let timer,longFired=false;
+  b.addEventListener('mousedown',()=>{{longFired=false;
+    timer=setTimeout(()=>{{longFired=true;cmd('save:'+i)}},600)}});
+  b.addEventListener('mouseup',()=>clearTimeout(timer));
+  b.addEventListener('mouseleave',()=>clearTimeout(timer));
+  b.addEventListener('click',()=>{{if(longFired)return;
+    cmd(FAVS[i]!=null?'fav:'+i:'save:'+i)}});
+}}
 let CONNECTING=false;
 function setConn(c,label){{CONN=c;CONNECTING=label==='연결 중...';
 $('status').textContent=label;apply()}}
 function apply(){{
-$('bsit').disabled=!CONN||!SIT;$('bstand').disabled=!CONN||!STAND;
+for(let i=0;i<3;i++)$('f'+i).disabled=!CONN;
 $('bstop').disabled=!CONN;$('bup').disabled=!CONN;$('bdn').disabled=!CONN;
-$('ssit').disabled=!CONN;$('sstand').disabled=!CONN;
 // 새로고침은 끊김 상태에서 재연결 버튼을 겸함 — 연결 시도 중에만 비활성
 $('brefresh').disabled=CONNECTING}}
 function fmt(s){{const h=Math.floor(s/3600),m=Math.round(s%3600/60);return (h?h+'시간 ':'')+m+'분'}}
@@ -148,14 +161,13 @@ function draw(){{
 }}
 addEventListener('resize',draw);draw();
 setTitle('{big}');
-setPresets(SIT,STAND);
+setFavs(FAVS);
 setConn(CONN,CONN?'연결됨':'연결 안 됨');
 </script></body></html>"##,
         data = data,
         threshold = s.threshold_cm,
         connected = s.connected,
-        sit_set = s.sit_set,
-        stand_set = s.stand_set,
+        favs = favs,
         big = s.big,
     )
 }

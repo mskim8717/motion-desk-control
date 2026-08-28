@@ -23,12 +23,6 @@ const SCAN_TIMEOUT: Duration = Duration::from_secs(30);
 const PANEL_W: f64 = 260.0;
 const PANEL_H: f64 = 312.0;
 
-#[derive(Debug, Clone, Copy, PartialEq)]
-enum Slot {
-    Sit,
-    Stand,
-}
-
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 enum ConnState {
@@ -58,15 +52,15 @@ enum UserEvent {
     Ipc(String),
     /// 메뉴바 타이틀 갱신 (예: "↕ 78cm", "↕ 이동 중...")
     Title(String),
-    /// "현재 높이를 프리셋으로 저장" 완료 (슬롯, 측정된 높이)
-    SlotSaved(Slot, f32),
+    /// "현재 높이를 즐겨찾기로 저장" 완료 (슬롯 번호, 측정된 높이)
+    SlotSaved(usize, f32),
     /// 연결 상태 변경 — 메뉴/패널 활성 갱신
     Conn(ConnState),
 }
 
 enum DeskCmd {
     GoTo(f32),
-    SaveSlot(Slot),
+    SaveSlot(usize),
     Stop,
     Refresh,
 }
@@ -142,8 +136,7 @@ fn main() {
                         let state = panel::PanelState {
                             big: cur_title.trim_start_matches("↕ "),
                             connected: cur_conn == ConnState::Connected,
-                            sit_set: cfg.sit.is_some(),
-                            stand_set: cfg.stand.is_some(),
+                            favs: cfg.favs(),
                             samples: &history::load_recent(86400),
                             threshold_cm: standing_threshold(&cfg),
                         };
@@ -157,21 +150,28 @@ fn main() {
             }
             Event::UserEvent(UserEvent::Ipc(msg)) => {
                 let cmd = match msg.as_str() {
-                    "sit" => cfg.sit.map(DeskCmd::GoTo),
-                    "stand" => cfg.stand.map(DeskCmd::GoTo),
                     // ▲▼ 홀드: 리밋 방향으로 이동 시작, 버튼을 떼면 "stop"이 와서 중단
                     "up" => Some(DeskCmd::GoTo(desk_core::MAX_CM)),
                     "down" => Some(DeskCmd::GoTo(desk_core::MIN_CM)),
                     "stop" => Some(DeskCmd::Stop),
-                    "save_sit" => Some(DeskCmd::SaveSlot(Slot::Sit)),
-                    "save_stand" => Some(DeskCmd::SaveSlot(Slot::Stand)),
                     "refresh" => Some(DeskCmd::Refresh),
                     "quit" => {
                         // 프로세스 종료 시 BLE 연결이 끊기고 책상은 자동 정지함 (데드맨)
                         *control_flow = ControlFlow::Exit;
                         None
                     }
-                    _ => None,
+                    // "fav:N" 즐겨찾기로 이동, "save:N" 현재 높이를 슬롯 N에 저장
+                    m => {
+                        if let Some(i) = m.strip_prefix("fav:").and_then(|s| s.parse().ok()) {
+                            cfg.favs().get::<usize>(i).copied().flatten().map(DeskCmd::GoTo)
+                        } else if let Some(i) =
+                            m.strip_prefix("save:").and_then(|s| s.parse::<usize>().ok())
+                        {
+                            (i < config::FAV_SLOTS).then_some(DeskCmd::SaveSlot(i))
+                        } else {
+                            None
+                        }
+                    }
                 };
                 if let Some(cmd) = cmd {
                     let _ = cmd_tx.send(cmd);
@@ -199,18 +199,16 @@ fn main() {
                 }
             }
             Event::UserEvent(UserEvent::SlotSaved(slot, cm)) => {
-                let field = match slot {
-                    Slot::Sit => &mut cfg.sit,
-                    Slot::Stand => &mut cfg.stand,
-                };
-                *field = Some(cm);
+                cfg.set_fav(slot, cm);
                 cfg.save();
                 if let Some((_, wv)) = &panel_win {
-                    let _ = wv.evaluate_script(&format!(
-                        "setPresets({},{})",
-                        cfg.sit.is_some(),
-                        cfg.stand.is_some()
-                    ));
+                    let favs = cfg
+                        .favs()
+                        .iter()
+                        .map(|f| f.map(|v| format!("{:.1}", v)).unwrap_or_else(|| "null".into()))
+                        .collect::<Vec<_>>()
+                        .join(",");
+                    let _ = wv.evaluate_script(&format!("setFavs([{}])", favs));
                 }
             }
             _ => {}
@@ -218,11 +216,15 @@ fn main() {
     });
 }
 
-/// 서기 판정 기준: 두 프리셋의 중간값, 없으면 90cm
+/// 서기 판정 기준: 즐겨찾기 최저·최고의 중간값, 2개 미만이면 90cm
 fn standing_threshold(cfg: &Config) -> f32 {
-    match (cfg.sit, cfg.stand) {
-        (Some(a), Some(b)) => (a + b) / 2.0,
-        _ => 90.0,
+    let set: Vec<f32> = cfg.favs().iter().flatten().copied().collect();
+    if set.len() >= 2 {
+        let min = set.iter().cloned().fold(f32::MAX, f32::min);
+        let max = set.iter().cloned().fold(f32::MIN, f32::max);
+        (min + max) / 2.0
+    } else {
+        90.0
     }
 }
 
