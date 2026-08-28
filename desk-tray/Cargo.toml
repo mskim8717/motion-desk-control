@@ -7,6 +7,8 @@ edition = "2021"
 # Info.plist 추가 항목(BLE 권한 문구, LSUIElement)은 scripts/bundle.sh가 주입
 [package.metadata.bundle]
 name = "MotionDesk"
+# scripts/gen_icon.py로 생성. 경로는 cargo bundle 실행 위치(워크스페이스 루트) 기준
+icon = ["desk-tray/assets/icon.icns"]
 identifier = "com.mskim8717.motiondesk"
 category = "public.app-category.utilities"
 short_description = "데스커 모션데스크 BLE 제어 메뉴바 앱"
