@@ -37,13 +37,6 @@ impl Slot {
             Slot::Stand => "② 서기",
         }
     }
-
-    fn label(self, cm: Option<f32>) -> String {
-        match cm {
-            Some(cm) => format!("{} ({:.0}cm)", self.name(), cm),
-            None => format!("{} (미설정)", self.name()),
-        }
-    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -191,8 +184,8 @@ fn main() {
                         let state = panel::PanelState {
                             big: cur_title.trim_start_matches("↕ "),
                             connected: cur_conn == ConnState::Connected,
-                            sit_label: cfg.sit.map(|_| "앉기".to_string()),
-                            stand_label: cfg.stand.map(|_| "서기".to_string()),
+                            sit_set: cfg.sit.is_some(),
+                            stand_set: cfg.stand.is_some(),
                             samples: &history::load_recent(86400),
                             threshold_cm: standing_threshold(&cfg),
                         };
@@ -208,7 +201,12 @@ fn main() {
                 let cmd = match msg.as_str() {
                     "sit" => cfg.sit.map(DeskCmd::GoTo),
                     "stand" => cfg.stand.map(DeskCmd::GoTo),
+                    // ▲▼ 홀드: 리밋 방향으로 이동 시작, 버튼을 떼면 "stop"이 와서 중단
+                    "up" => Some(DeskCmd::GoTo(desk_core::MAX_CM)),
+                    "down" => Some(DeskCmd::GoTo(desk_core::MIN_CM)),
                     "stop" => Some(DeskCmd::Stop),
+                    "save_sit" => Some(DeskCmd::SaveSlot(Slot::Sit)),
+                    "save_stand" => Some(DeskCmd::SaveSlot(Slot::Stand)),
                     _ => None,
                 };
                 if let Some(cmd) = cmd {
@@ -248,6 +246,13 @@ fn main() {
                 *field = Some(cm);
                 cfg.save();
                 reset_item.set_enabled(true);
+                if let Some((_, wv)) = &panel_win {
+                    let _ = wv.evaluate_script(&format!(
+                        "setPresets({},{})",
+                        cfg.sit.is_some(),
+                        cfg.stand.is_some()
+                    ));
+                }
             }
             Event::UserEvent(UserEvent::Menu(e)) => {
                 let cmd = if e.id() == save_sit_item.id() {
