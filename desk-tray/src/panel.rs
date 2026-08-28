@@ -109,9 +109,14 @@ for(let i=0;i<3;i++){{
   b.addEventListener('click',()=>{{if(longFired)return;
     cmd(FAVS[i]!=null?'fav:'+i:'save:'+i)}});
 }}
-let CONNECTING=false;
-function setConn(c,label){{CONN=c;CONNECTING=label==='연결 중...';
+let CONNECTING=false,CONNLABEL='';
+function setConn(c,label){{CONN=c;CONNECTING=label==='연결 중...';CONNLABEL=label;
 $('status').textContent=label;apply()}}
+// 상태 줄에 잠깐 안내 메시지를 띄웠다가 원래 상태로 복귀
+let toastTimer;
+function toast(msg){{const s=$('status');clearTimeout(toastTimer);
+s.textContent=msg;s.style.visibility='visible';
+toastTimer=setTimeout(()=>{{s.textContent=CONNLABEL}},2000)}}
 function apply(){{
 for(let i=0;i<3;i++)$('f'+i).disabled=!CONN;
 $('bstop').disabled=!CONN;$('bup').disabled=!CONN;$('bdn').disabled=!CONN;

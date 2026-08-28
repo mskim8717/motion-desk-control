@@ -199,8 +199,20 @@ fn main() {
                 }
             }
             Event::UserEvent(UserEvent::SlotSaved(slot, cm)) => {
-                cfg.set_fav(slot, cm);
-                cfg.save();
+                // 다른 슬롯에 이미 같은 높이(±1cm)가 있으면 중복 저장 거부
+                let duplicate = cfg
+                    .favs()
+                    .iter()
+                    .enumerate()
+                    .any(|(i, f)| i != slot && f.is_some_and(|v| (v - cm).abs() < 1.0));
+                if duplicate {
+                    if let Some((_, wv)) = &panel_win {
+                        let _ = wv.evaluate_script("toast('이미 같은 높이가 저장되어 있어요')");
+                    }
+                } else {
+                    cfg.set_fav(slot, cm);
+                    cfg.save();
+                }
                 if let Some((_, wv)) = &panel_win {
                     let favs = cfg
                         .favs()
