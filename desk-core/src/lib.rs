@@ -103,6 +103,26 @@ impl Desk {
         let peripheral =
             found.ok_or("책상을 찾지 못함 (전원/거리 확인, 첫 연결이면 스위치 ⌘버튼 2초)")?;
 
+        // 절전에서 깨어나는 중이면 연결 직후 끊기는 일이 흔함 → 몇 차례 재시도
+        let mut last_err: Error = "연결 재시도 소진".into();
+        for attempt in 0..3 {
+            if attempt > 0 {
+                let _ = peripheral.disconnect().await;
+                time::sleep(Duration::from_millis(1000)).await;
+            }
+            match Self::setup(peripheral.clone()).await {
+                Ok(desk) => return Ok(desk),
+                Err(e) => {
+                    eprintln!("연결 시도 {} 실패: {}", attempt + 1, e);
+                    last_err = e;
+                }
+            }
+        }
+        Err(last_err)
+    }
+
+    /// 연결 → 서비스 검색 → 캐릭터리스틱 확인 → DPG 핸드셰이크
+    async fn setup(peripheral: Peripheral) -> Result<Self> {
         peripheral.connect().await?;
         peripheral.discover_services().await?;
 
